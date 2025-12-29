@@ -165,6 +165,138 @@ function setQuickExamDurationSeconds(seconds) {
     const s = clampInt(seconds, 60, 60 * 60, DEFAULT_QUICK_EXAM_DURATION_SECONDS);
     localStorage.setItem(QUICK_EXAM_DURATION_KEY, String(s));
 }
+// =====================
+// مزامنة مدة التحدي والاختبار السريع عبر Firestore (عشان كل المستخدمين ياخدوا نفس المدة)
+// =====================
+
+let __examDurationsUnsub = null;
+
+function normalizeExamDurationsValue(value) {
+    if (!value || typeof value !== 'object') return null;
+
+    // نقبل أكثر من اسم للحقل للتوافق (لو اتغيرت التسمية قبل كده)
+    const rawCh = value.challengeSeconds ?? value.challenge ?? value.challengeDurationSeconds ?? value.challengeDuration ?? value.challengeTimeSeconds;
+    const rawQ = value.quickSeconds ?? value.quick ?? value.quickExamDurationSeconds ?? value.quickExamDuration ?? value.quickTimeSeconds;
+
+    const ch = clampInt(rawCh, 60, 60 * 60, DEFAULT_CHALLENGE_DURATION_SECONDS);
+    const q = clampInt(rawQ, 60, 60 * 60, DEFAULT_QUICK_EXAM_DURATION_SECONDS);
+
+    return { challengeSeconds: ch, quickSeconds: q };
+}
+
+async function saveExamDurationsToFirestore(challengeSeconds, quickSeconds) {
+    try {
+        if (!isFirestoreReady()) return false;
+
+        const value = normalizeExamDurationsValue({ challengeSeconds, quickSeconds });
+        if (!value) return false;
+
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const payload = {
+            type: 'examDurations',
+            value: value,
+            createdAtMs: Date.now(),
+            createdAt: api.serverTimestamp()
+        };
+
+        await api.addDoc(api.collection(db, FIRESTORE_CONFIG_COLLECTION), payload);
+        return true;
+    } catch (e) {
+        console.warn('Failed to save exam durations to Firestore:', e);
+        return false;
+    }
+}
+
+function applySyncedExamDurations(value, { updateUI = true } = {}) {
+    const norm = normalizeExamDurationsValue(value);
+    if (!norm) return;
+
+    const oldCh = getChallengeDurationSeconds();
+    const oldQ = getQuickExamDurationSeconds();
+
+    if (oldCh === norm.challengeSeconds && oldQ === norm.quickSeconds) return;
+
+    // نخزن محلياً كـ fallback
+    setChallengeDurationSeconds(norm.challengeSeconds);
+    setQuickExamDurationSeconds(norm.quickSeconds);
+
+    if (updateUI && typeof initDurationSettingsUI === 'function') {
+        try { initDurationSettingsUI(); } catch (e) {}
+    }
+}
+
+async function syncExamDurationsFromFirestore() {
+    try {
+        if (!isFirestoreReady()) return false;
+
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const q = api.query(
+            api.collection(db, FIRESTORE_CONFIG_COLLECTION),
+            api.orderBy('createdAtMs', 'desc'),
+            api.limit(50)
+        );
+
+        const snap = await api.getDocs(q);
+
+        let latest = null;
+        snap.forEach(docSnap => {
+            const d = docSnap.data();
+            if (!latest && d && d.type === 'examDurations' && d.value && typeof d.value === 'object') {
+                latest = d.value;
+            }
+        });
+
+        if (!latest) return false;
+
+        applySyncedExamDurations(latest, { updateUI: true });
+        return true;
+    } catch (e) {
+        console.warn('Failed to sync exam durations from Firestore:', e);
+        return false;
+    }
+}
+
+function initExamDurationsSync() {
+    // one-time pull
+    syncExamDurationsFromFirestore();
+
+    // real-time updates
+    try {
+        if (!isFirestoreReady()) return;
+        if (__examDurationsUnsub) return;
+
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const q = api.query(
+            api.collection(db, FIRESTORE_CONFIG_COLLECTION),
+            api.orderBy('createdAtMs', 'desc'),
+            api.limit(50)
+        );
+
+        __examDurationsUnsub = api.onSnapshot(q, (snap) => {
+            let latest = null;
+            snap.forEach(docSnap => {
+                const d = docSnap.data();
+                if (!latest && d && d.type === 'examDurations' && d.value && typeof d.value === 'object') {
+                    latest = d.value;
+                }
+            });
+
+            if (!latest) return;
+            applySyncedExamDurations(latest, { updateUI: true });
+        }, (err) => {
+            console.warn('Exam durations realtime sync failed:', err);
+        });
+    } catch (e) {
+        console.warn('Failed to init exam durations sync:', e);
+    }
+}
+
 
 function formatMMSS(totalSeconds) {
     const s = Math.max(0, parseInt(totalSeconds, 10) || 0);
@@ -1251,6 +1383,7 @@ async function handleAuthStateChanged(user) {
     setMainPlatformVisible(true);
     applyRoleVisibilityToUI();
     try { initChallengeQuestionsSync(); } catch (e) {}
+    try { initExamDurationsSync(); } catch (e) {}
     startPresenceLoop();
 }
 
@@ -1503,6 +1636,9 @@ function saveExamDurations() {
 
     setChallengeDurationSeconds(chMin * 60);
     setQuickExamDurationSeconds(qMin * 60);
+
+    // مشاركة مدة الامتحان لكل المستخدمين (لو Firebase متاح)
+    saveExamDurationsToFirestore(chMin * 60, qMin * 60);
 
     // حفظ اسم مادة التحدي (اختياري)
     const rawSubject = String(subj?.value || '').trim();
