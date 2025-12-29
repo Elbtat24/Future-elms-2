@@ -166,6 +166,126 @@ function setQuickExamDurationSeconds(seconds) {
     localStorage.setItem(QUICK_EXAM_DURATION_KEY, String(s));
 }
 
+// ==========================================
+// مزامنة مدة الامتحان مع Firestore (زي مزامنة أسئلة التحدي)
+// ==========================================
+let __examDurationsUnsub = null;
+
+async function saveExamDurationsToFirestore(challengeSeconds, quickSeconds) {
+    try {
+        if (!isFirestoreReady()) return false;
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const payload = {
+            type: 'examDurations',
+            value: {
+                challengeSeconds: clampInt(challengeSeconds, 60, 60 * 60, DEFAULT_CHALLENGE_DURATION_SECONDS),
+                quickSeconds: clampInt(quickSeconds, 60, 60 * 60, DEFAULT_QUICK_EXAM_DURATION_SECONDS)
+            },
+            createdAtMs: Date.now(),
+            createdAt: api.serverTimestamp()
+        };
+
+        await api.addDoc(api.collection(db, FIRESTORE_CONFIG_COLLECTION), payload);
+        return true;
+    } catch (e) {
+        console.warn('Failed to save exam durations to Firestore:', e);
+        return false;
+    }
+}
+
+function applySyncedExamDurationsFromFirestore(valueObj) {
+    if (!valueObj || typeof valueObj !== 'object') return false;
+
+    const ch = clampInt(valueObj.challengeSeconds, 60, 60 * 60, getChallengeDurationSeconds());
+    const q = clampInt(valueObj.quickSeconds, 60, 60 * 60, getQuickExamDurationSeconds());
+
+    const prevCh = getChallengeDurationSeconds();
+    const prevQ = getQuickExamDurationSeconds();
+
+    if (ch !== prevCh) setChallengeDurationSeconds(ch);
+    if (q !== prevQ) setQuickExamDurationSeconds(q);
+
+    // تحديث الواجهة (بدون التأثير على مؤقت شغال)
+    try { initDurationSettingsUI(); } catch (e) {}
+
+    return true;
+}
+
+async function syncExamDurationsFromFirestore() {
+    try {
+        if (!isFirestoreReady()) return false;
+
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const q = api.query(
+            api.collection(db, FIRESTORE_CONFIG_COLLECTION),
+            api.orderBy('createdAtMs', 'desc'),
+            api.limit(50)
+        );
+
+        const snap = await api.getDocs(q);
+
+        let latest = null;
+        snap.forEach(docSnap => {
+            const d = docSnap.data();
+            if (!latest && d && d.type === 'examDurations' && d.value && typeof d.value === 'object') {
+                latest = d.value;
+            }
+        });
+
+        if (latest) {
+            return applySyncedExamDurationsFromFirestore(latest);
+        }
+        return false;
+    } catch (e) {
+        console.warn('Failed to sync exam durations from Firestore:', e);
+        return false;
+    }
+}
+
+function initExamDurationsSync() {
+    try {
+        if (!isFirestoreReady()) return;
+
+        // جلب آخر إعداد مرة واحدة
+        syncExamDurationsFromFirestore();
+
+        const api = window.firestoreApi;
+        const db = window.firestoreDb;
+
+        const q = api.query(
+            api.collection(db, FIRESTORE_CONFIG_COLLECTION),
+            api.orderBy('createdAtMs', 'desc'),
+            api.limit(10)
+        );
+
+        if (__examDurationsUnsub) {
+            try { __examDurationsUnsub(); } catch (e) {}
+            __examDurationsUnsub = null;
+        }
+
+        if (!api.onSnapshot) return;
+
+        __examDurationsUnsub = api.onSnapshot(q, (snap) => {
+            let latest = null;
+            (snap.docs || []).forEach(docSnap => {
+                const d = docSnap.data();
+                if (!latest && d && d.type === 'examDurations' && d.value && typeof d.value === 'object') {
+                    latest = d.value;
+                }
+            });
+            if (latest) applySyncedExamDurationsFromFirestore(latest);
+        }, (err) => {
+            console.warn('Exam durations realtime sync failed:', err);
+        });
+    } catch (e) {
+        console.warn('Failed to init exam durations sync:', e);
+    }
+}
+
 function formatMMSS(totalSeconds) {
     const s = Math.max(0, parseInt(totalSeconds, 10) || 0);
     const m = Math.floor(s / 60);
@@ -1251,6 +1371,8 @@ async function handleAuthStateChanged(user) {
     setMainPlatformVisible(true);
     applyRoleVisibilityToUI();
     try { initChallengeQuestionsSync(); } catch (e) {}
+    try { initExamDurationsSync(); } catch (e) {}
+    try { syncChallengeSubjectNameFromFirestore(); } catch (e) {}
     startPresenceLoop();
 }
 
@@ -1501,11 +1623,11 @@ function saveExamDurations() {
     const chMin = clampInt(ch?.value, 1, 60, Math.round(DEFAULT_CHALLENGE_DURATION_SECONDS / 60));
     const qMin = clampInt(q?.value, 1, 60, Math.round(DEFAULT_QUICK_EXAM_DURATION_SECONDS / 60));
 
-    setChallengeDurationSeconds(chMin * 60);
-    setQuickExamDurationSeconds(qMin * 60);
-
-    // حفظ اسم مادة التحدي (اختياري)
+    // تحضير اسم مادة التحدي (اختياري) قبل الحفظ
     const rawSubject = String(subj?.value || '').trim();
+    let finalSubject = '';
+    let subjectToSave = DEFAULT_CHALLENGE_SUBJECT_NAME;
+
     if (rawSubject) {
         const cleanSubject = filterSubjectName(rawSubject);
         if (!cleanSubject) {
@@ -1514,14 +1636,26 @@ function saveExamDurations() {
             subj?.select?.();
             return;
         }
-        setChallengeSubjectName(cleanSubject);
-        // مشاركة الإعداد (لو Firebase متاح)
-        saveChallengeSubjectNameToFirestore(cleanSubject);
+        finalSubject = cleanSubject;
+        subjectToSave = cleanSubject;
     } else {
         // لو فاضي: رجوع للافتراضي
-        setChallengeSubjectName('');
-        saveChallengeSubjectNameToFirestore(DEFAULT_CHALLENGE_SUBJECT_NAME);
+        finalSubject = '';
+        subjectToSave = DEFAULT_CHALLENGE_SUBJECT_NAME;
     }
+
+    // حفظ المدد محلياً
+    const chSeconds = chMin * 60;
+    const qSeconds = qMin * 60;
+    setChallengeDurationSeconds(chSeconds);
+    setQuickExamDurationSeconds(qSeconds);
+
+    // مزامنة المدد للجميع عبر Firestore (زي مزامنة الأسئلة)
+    saveExamDurationsToFirestore(chSeconds, qSeconds);
+
+    // حفظ اسم مادة التحدي (ومزامنته)
+    setChallengeSubjectName(finalSubject);
+    saveChallengeSubjectNameToFirestore(subjectToSave);
 
     initDurationSettingsUI();
     applyChallengeSubjectNameToUI();
